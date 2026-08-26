@@ -1,0 +1,7 @@
+.env
+node_modules/
+logs/
+state.json
+gateway.lock
+serve.log
+*.log.*
