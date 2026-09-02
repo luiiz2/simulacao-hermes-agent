@@ -175,6 +175,38 @@ test("processamento de update persiste o offset depois do handler", async () => 
   assert.equal(received.text, "olá");
 });
 
+test("processamento de update não bloqueia enquanto o handler aguarda a tarefa", async () => {
+  const { t } = fakeAdapter();
+  let release;
+  let started = false;
+  const gate = new Promise((resolve) => { release = resolve; });
+  t.onMessage = async () => {
+    started = true;
+    await gate;
+  };
+
+  const processing = t._processUpdate({
+    update_id: 42,
+    message: {
+      chat: { id: 123 },
+      from: { id: 111, first_name: "Dev" },
+      text: "tarefa longa",
+      message_id: 103,
+    },
+  });
+  await Promise.resolve();
+  assert.equal(started, true);
+
+  const returnedBeforeHandler = await Promise.race([
+    processing.then(() => true),
+    new Promise((resolve) => setTimeout(() => resolve(false), 25)),
+  ]);
+  assert.equal(returnedBeforeHandler, true);
+
+  release();
+  await processing;
+});
+
 
 test("splitMessage quebra texto longo preferencialmente em quebras de linha", async () => {
   const { splitMessage } = await import("../src/adapters/telegram.mjs");

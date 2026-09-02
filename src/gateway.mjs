@@ -19,6 +19,8 @@ import { canDispatchCallback, canDispatchCommand, parseCallbackData, parseComman
 import { cleanupTemporaryFiles } from "./files.mjs";
 import { RecentDeduplicator } from "./dedup.mjs";
 import { missingSelection } from "./selection.mjs";
+import { isPermissionAskedEvent, permissionMarkup, selectPendingPermission } from "./permissions.mjs";
+import { SerialTaskQueue } from "./taskQueue.mjs";
 
 process.chdir(process.env.GATEWAY_WORKDIR || ROOT);
 mkdirSync(CFG.generalWorkspace, { recursive: true });
@@ -70,6 +72,7 @@ const sessionChats = new Map(); // sessionID -> { channel, userId, chatId } (for
 const pendingPerms = new Map(); // permID -> {sessionID, channel, chatId, ts}
 const recentMessages = new RecentDeduplicator();
 const modelMenus = new Map();
+const aiQueue = new SerialTaskQueue();
 const MODEL_MENU_TTL_MS = 10 * 60_000;
 const MODEL_PAGE_SIZE = 12;
 
@@ -216,6 +219,14 @@ function replyFn(m) {
 
 function makeCtx(m, chat, args = "") {
   return { channel: m.channel, userId: m.userId, chatId: m.chatId, msg: m, chat, args, reply: replyFn(m) };
+}
+
+function chatTaskKey(target) {
+  return `${target.channel}:${target.userId}`;
+}
+
+function enqueueAi(m, chat, promptText) {
+  return aiQueue.enqueue(chatTaskKey(m), () => aiFlow(m, chat, promptText));
 }
 
 // ---------- AI flow ----------
@@ -383,15 +394,25 @@ engine.subscribeEvents(async (ev) => {
       telegram.editMessage(st.chatId, st.messageId, sanitizeForChat(st.text)).catch(() => {});
       if (st.done) streams.delete(sid);
     }
-  } else if (/permission/i.test(type)) {
+  } else if (isPermissionAskedEvent(type)) {
     const id = props.permissionID ?? props.id ?? props.requestID;
     const sid = props.sessionID;
     const target = sid ? sessionChats.get(sid) : null;
-    if (!id || !target) return;
+    if (!id || !target) {
+      log("warn", "permission_unroutable", {
+        type,
+        hasPermissionId: Boolean(id),
+        hasSessionId: Boolean(sid),
+      });
+      return;
+    }
     const { channel, chatId } = typeof target === "object" ? target : { channel: "telegram", chatId: target };
     pendingPerms.set(String(id), { sessionID: sid, channel, chatId, ts: Date.now() });
-    const msg = `⚠️ Confirmação necessária\nAção: ${sanitizeForChat(props.title || props.action || type)}\n\n/approve ${id}\nou /deny ${id}`;
-    if (channel === "telegram") telegram.sendMessage(chatId, msg).catch(() => {});
+    const action = sanitizeForChat(props.title || props.action || props.permission || type);
+    const msg = `⚠️ Confirmação necessária\nAção: ${action}\n\n/approve ${id}\nou /deny ${id}`;
+    const extra = channel === "telegram" ? { reply_markup: permissionMarkup(String(id)) } : {};
+    log("info", "permission_requested", { channel, action });
+    if (channel === "telegram") telegram.sendMessage(chatId, msg, extra).catch(() => {});
     else if (channel === "instagram") instagram.sendMessage(chatId, msg).catch(() => {});
   }
 });
@@ -466,7 +487,7 @@ const HANDLERS = {
   },
   retry: async (ctx) => {
     if (!ctx.chat.lastPrompt) return ctx.reply("Nada para reenviar.");
-    await aiFlow(ctx.msg, ctx.chat, ctx.chat.lastPrompt);
+    await enqueueAi(ctx.msg, ctx.chat, ctx.chat.lastPrompt);
   },
   undo: async (ctx) => {
     if (!ctx.chat.sessionId) return ctx.reply("Sem conversa ativa.");
@@ -648,7 +669,7 @@ const HANDLERS = {
   },
   status: async (ctx) => {
     const healthy = await engine.healthy();
-    const busy = [...streams.values()].some((s) => !s.done);
+    const busy = aiQueue.has(chatTaskKey(ctx)) || [...streams.values()].some((s) => !s.done);
     const project = !ctx.chat.projectSelected
       ? "não escolhido"
       : (ctx.chat.workspace || "sem projeto");
@@ -747,13 +768,24 @@ function sensitiveCmd(action) {
 
 function permCmd(response) {
   return async (ctx) => {
-    const id = ctx.args.trim();
-    const p = pendingPerms.get(id);
-    if (!p) return ctx.reply("Nenhuma permissão pendente com esse id.");
-    if (Date.now() - p.ts > 30 * 60_000) {
-      pendingPerms.delete(id);
+    const selection = selectPendingPermission(pendingPerms, ctx.args, {
+      channel: ctx.channel,
+      chatId: ctx.chatId,
+    });
+    const command = response === "allow" ? "approve" : "deny";
+    if (selection.status === "ambiguous") {
+      return ctx.reply(
+        `Há várias permissões pendentes neste chat. Use /${command} <ID>:\n${selection.ids.map((id) => `• ${id}`).join("\n")}`
+      );
+    }
+    if (selection.status === "expired") {
+      pendingPerms.delete(selection.id);
       return ctx.reply("Permissão expirada (>30 min). Peça a ação novamente.");
     }
+    if (selection.status !== "found") {
+      return ctx.reply(`Uso: /${command} <ID>. Nenhuma permissão pendente encontrada neste chat.`);
+    }
+    const { id, entry: p } = selection;
     pendingPerms.delete(id);
     const ok = await engine.respondPermission(p.sessionID, id, response);
     await ctx.reply(ok ? (response === "allow" ? "✅ Aprovada." : "🚫 Negada.") : "Falha ao responder permissão.");
@@ -817,7 +849,7 @@ async function handleMessageInner(m) {
     }
   }
 
-  await aiFlow(m, chat, text);
+  await enqueueAi(m, chat, text);
 }
 
 // ---------- callbacks ----------
@@ -929,16 +961,25 @@ telegram.onCallback = async (c) => {
     }
   } else if (kind === "perm") {
     if (!isAdminUser(c.userId, CFG)) return;
-    const p = pendingPerms.get(a);
-    if (!p) { telegram.sendMessage(c.chatId, "Permissão expirada."); return; }
-    if (Date.now() - p.ts > 30 * 60_000) {
-      pendingPerms.delete(a);
+    const response = b === "y" ? "allow" : b === "n" ? "deny" : null;
+    if (!response) return telegram.sendMessage(c.chatId, "Resposta de permissão inválida.").catch(() => {});
+    const selection = selectPendingPermission(pendingPerms, a, {
+      channel: c.channel,
+      chatId: c.chatId,
+    });
+    if (selection.status === "expired") {
+      pendingPerms.delete(selection.id);
       telegram.sendMessage(c.chatId, "Permissão expirada (>30 min).").catch(() => {});
       return;
     }
-    pendingPerms.delete(a);
-    const ok = await engine.respondPermission(p.sessionID, a, b === "y" ? "allow" : "deny");
-    telegram.sendMessage(c.chatId, ok ? (b === "y" ? "✅ Aprovada." : "🚫 Negada.") : "Falha.").catch(() => {});
+    if (selection.status !== "found") {
+      telegram.sendMessage(c.chatId, "Permissão expirada ou não encontrada.").catch(() => {});
+      return;
+    }
+    const { id, entry: p } = selection;
+    pendingPerms.delete(id);
+    const ok = await engine.respondPermission(p.sessionID, id, response);
+    telegram.sendMessage(c.chatId, ok ? (response === "allow" ? "✅ Aprovada." : "🚫 Negada.") : "Falha.").catch(() => {});
   }
 };
 

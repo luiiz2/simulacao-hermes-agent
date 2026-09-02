@@ -104,6 +104,32 @@ test("prompt preserva MIME e nome de documento anexado", async () => {
   assert.equal(promptBody.parts[1].filename, "script.py");
 });
 
+test("prompt não impõe limite artificial quando MODEL_TIMEOUT_MS não está configurado", async () => {
+  const previous = process.env.MODEL_TIMEOUT_MS;
+  delete process.env.MODEL_TIMEOUT_MS;
+  const engine = new OpencodeEngine({
+    baseUrl: "http://127.0.0.1:4096",
+    username: "u",
+    password: "p",
+    workdir: "C:/",
+    log: () => {},
+  });
+  engine.resolveModel = async () => ({ providerID: "provider", modelID: "model" });
+  engine.client.session.prompt = async ({ signal }) => {
+    assert.equal(signal, undefined);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    return { data: { parts: [{ type: "text", text: "resposta longa" }] } };
+  };
+
+  try {
+    const result = await engine.prompt("ses_long", "tarefa", { mode: "auto" });
+    assert.equal(extractText(result), "resposta longa");
+  } finally {
+    if (previous === undefined) delete process.env.MODEL_TIMEOUT_MS;
+    else process.env.MODEL_TIMEOUT_MS = previous;
+  }
+});
+
 test("parseServerEndpoint extrai host e porta configuráveis", () => {
   assert.deepEqual(parseServerEndpoint("http://localhost:4097/"), {
     baseUrl: "http://localhost:4097",

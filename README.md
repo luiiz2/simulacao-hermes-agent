@@ -32,8 +32,9 @@ Local/CLI ──────┘      │  · sessões        │      │  (serv
 
 - 💬 **Conversa persistente** — contexto mantido entre mensagens; `/new` abre conversa nova sem perder o projeto
 - ⚡ **Streaming suave** — resposta editada ao vivo com throttle anti-429 (1200 ms) via SSE do OpenCode
+- 🕐 **Tarefas longas** — prompts não são abortados artificialmente e comandos continuam disponíveis durante a execução
 - 🖼️ **Multimodalidade & Arquivos** — envie fotos, prints e arquivos de código (`.py`, `.js`, `.json`, `.log`, `.csv`, etc.) direto no Telegram
-- 📱 **Teclado inline interativo** — botões de 1 toque no `/status`, `/model` e `/project`
+- 📱 **Teclado inline interativo** — botões de 1 toque no `/status`, `/model`, `/project` e permissões do agente
 - 🛡️ **Watchdog Auto-Heal** — monitoramento de saúde do `opencode serve` a cada 30s com reinício automático
 - 🧭 **32 comandos slash** com suporte a `/diff` (resumo de alterações) e aliases como `/compact`
 - 🤖 **Modos de roteamento**: `/auto` `/fast` `/code` `/deep` → modelos do seu provedor (ex.: OmniRoute)
@@ -67,6 +68,7 @@ Preencha o `.env`:
 | `TELEGRAM_ALLOWED_USER_IDS` | ✅ | Seu ID numérico (pegue no @userinfobot). Vírgula p/ vários |
 | `TELEGRAM_ADMIN_USER_IDS` | – | IDs com acesso aos comandos administrativos |
 | `DEFAULT_WORKSPACE` | – | Pasta do projeto padrão do agente |
+| `MODEL_TIMEOUT_MS` | – | Timeout client-side opcional; vazio/`0` não interrompe tarefas longas |
 | `MAX_ATTACHMENT_BYTES` | – | Limite de anexos baixados do Telegram (padrão: 10 MiB) |
 | `OPENCODE_SERVER_*` | – | URL/usuário/senha do servidor local |
 | `INSTAGRAM_*` / `META_*` | – | Só se quiser Instagram Direct |
@@ -91,13 +93,13 @@ Digitar `/` abre o menu. Visão geral:
 | **Modelo** | `/model` `/auto` `/fast` `/code` `/deep` |
 | **Projeto** | `/project` |
 | **Info** | `/status` `/whoami` `/platform` |
-| **Computador** | `/sys` `/ps` `/open` `/url` `/shot` `/shutdown` `/restart` `/confirm` `/approve` `/deny` |
+| **Computador** | `/sys` `/ps` `/open` `/url` `/shot` `/shutdown` `/restart` `/confirm` `/approve [id]` `/deny [id]` |
 | **Sistema** | `/debug` `/help` |
 
 Exemplos:
 
 ```
-Você:  Abra o projeto C:\dev\orbia
+Você:  /project orbia
 Bot:   📁 Projeto alterado... nova conversa criada nele.
 
 Você:  Rode os testes
@@ -119,6 +121,8 @@ src/
 ├── auth.mjs              allowlist, admins e propriedade de sessões
 ├── router.mjs            parsing puro de comandos e callbacks
 ├── files.mjs             MIME de anexos e limpeza de temporários
+├── permissions.mjs       seleção segura e botões de permissões
+├── taskQueue.mjs         serialização de tarefas por conversa
 ├── dedup.mjs             deduplicação por ID de mensagem com fallback curto
 ├── computer.mjs          ações diretas no Windows com níveis de segurança
 ├── sanitize.mjs          remove ANSI/banners + redige segredos na saída
@@ -131,10 +135,10 @@ src/
 Fluxo de uma mensagem:
 
 ```
-update_id → autorização → dedup (60s) → é comando? → handler local (<300ms)
-                                      └→ não → sessão persistente → prompt no
-                                         servidor OpenCode → SSE stream → edição
-                                         ao vivo no Telegram (sanitizado)
+update_id → autorização → dedup (60s) → comando local ou fila por conversa
+                                      └→ prompt persistente no OpenCode → SSE
+                                         stream → edição ao vivo no Telegram
+                                         (sanitizado; permissões continuam interativas)
 ```
 
 ## Segurança
@@ -144,7 +148,7 @@ update_id → autorização → dedup (60s) → é comando? → handler local (<
 - **Segredos**: `.env` fora do git; saída e logs passam por redação automática (`sk-…`, tokens, `KEY=`)
 - **Ações sensíveis** (desligar/reiniciar): exigem código de 6 dígitos gerado na hora
   - expira em 5 minutos · funciona uma única vez · vinculado ao usuário que pediu
-- **Permissões do agente**: pedidos perigosos do próprio OpenCode viram `/approve`/`/deny` no chat
+- **Permissões do agente**: pedidos perigosos do próprio OpenCode viram botões e `/approve`/`/deny`; sem ID, uma única pendência do chat é selecionada automaticamente
 - **Callbacks**: botões inline passam pela mesma allowlist e política de administrador dos comandos
 - **Isolamento de canais**: falha do Instagram não derruba o Telegram (e vice-versa)
 - **Logs locais apenas**, com rotação 5 MB × 3 e segredos redigidos
@@ -207,9 +211,11 @@ opencode models
 No Telegram, use `/model` para abrir os provedores e modelos detectados pelo
 OpenCode. É possível escolher `opencode/mimo-v2.5-free`,
 `opencode/nemotron-3-ultra-free`, um modelo do OmniRoute ou qualquer outro
-provedor listado. A conversa começa em **Sem projeto**; escolha o modelo em
-`/model` e envie a tarefa. Use `/project` somente quando quiser trabalhar em
-uma pasta específica.
+provedor listado. Para reproduzir o contexto de uma janela do OpenCode, escolha
+o projeto uma vez com `/project orbia` (ou o caminho completo), escolha o modelo
+em `/model` e envie a tarefa. Durante tarefas longas, `/status`, `/stop` e as
+confirmações continuam funcionando. `MODEL_TIMEOUT_MS` vazio/`0` é o modo
+recomendado; um valor positivo é apenas um limite operacional explícito.
 
 ## Licença
 

@@ -69,6 +69,18 @@ export class TelegramAdapter {
 
   async stop() { this.running = false; }
 
+  _dispatch(kind, handler, payload) {
+    if (typeof handler !== "function") return;
+    try {
+      const result = handler(payload);
+      if (result && typeof result.catch === "function") {
+        result.catch((error) => this.log("error", kind, { err: error.message }));
+      }
+    } catch (error) {
+      this.log("error", kind, { err: error.message });
+    }
+  }
+
   async _poll() {
     let backoff = 500;
     while (this.running) {
@@ -92,7 +104,7 @@ export class TelegramAdapter {
     this.offset = u.update_id + 1;
     try {
       if (u.callback_query && this.onCallback) {
-        await this.onCallback(this.normalizeCallback(u.callback_query));
+        this._dispatch("callback_handler_error", this.onCallback, this.normalizeCallback(u.callback_query));
       } else if (u.message) {
         if (u.message.photo?.length && this.onMessage) {
           const best = u.message.photo[u.message.photo.length - 1];
@@ -102,7 +114,7 @@ export class TelegramAdapter {
           } catch (err) {
             this.log("warn", "tg_photo_download_failed", { err: err.message });
           }
-          await this.onMessage(this.normalizeMessage({
+          this._dispatch("message_handler_error", this.onMessage, this.normalizeMessage({
             ...u.message,
             text: u.message.caption || "",
             photoPath,
@@ -117,7 +129,7 @@ export class TelegramAdapter {
           } catch (err) {
             this.log("warn", "tg_doc_download_failed", { err: err.message });
           }
-          await this.onMessage(this.normalizeMessage({
+          this._dispatch("message_handler_error", this.onMessage, this.normalizeMessage({
             ...u.message,
             text: u.message.caption || "",
             filePath,
@@ -131,7 +143,7 @@ export class TelegramAdapter {
             "🎤 Mensagens de voz ainda não são processadas. Envie em texto ou anexe arquivos/fotos."
           ).catch(() => {});
         } else if (u.message.text && this.onMessage) {
-          await this.onMessage(this.normalizeMessage(u.message));
+          this._dispatch("message_handler_error", this.onMessage, this.normalizeMessage(u.message));
         }
       }
     } catch (e) {

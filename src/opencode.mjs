@@ -359,12 +359,18 @@ export class OpencodeEngine {
         });
       } catch {}
     }
-    const timeoutMs = Number(process.env.MODEL_TIMEOUT_MS || 25_000);
-    const r = await this.client.session.prompt({
+    const timeoutMs = Number(process.env.MODEL_TIMEOUT_MS);
+    const request = {
       path: { id: sessionID },
       body: { model, parts },
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    };
+    // OpenCode prompts can legitimately wait for a permission or run longer
+    // than a short HTTP request. Only opt into a client-side timeout when the
+    // operator explicitly configures a positive value.
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      request.signal = AbortSignal.timeout(timeoutMs);
+    }
+    const r = await this.client.session.prompt(request);
     this.log("info", "prompt_done", { sessionID, ms: Date.now() - t0 });
     const failure = promptResponseError(r);
     if (failure) throw failure;
